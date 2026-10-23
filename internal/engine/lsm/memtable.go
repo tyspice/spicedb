@@ -1,6 +1,10 @@
 package lsm
 
-import "sync"
+import (
+	"bytes"
+	"sync"
+	"unsafe"
+)
 
 type color uint8
 
@@ -165,4 +169,53 @@ func (m *memtable) insertFixup(z *memNode) {
 		}
 	}
 	m.root.color = black
+}
+
+// insertOrDelete inserts an entry for key, or overwrites the existing one.
+// A tombstone marks the key as deleted. The memtable stores copies of key
+// and value. The caller must hold m.mu.
+func (m *memtable) insertOrDelete(key []byte, value []byte, tombstone bool) {
+	var compared int
+	y := m.leaf
+	x := m.root
+	for x != m.leaf {
+		y = x
+		compared = bytes.Compare(key, x.key)
+		// If the keys are the same then all we
+		// need to do is update the value
+		// and the tombstone and return early
+		// since we're just modifying an existing node
+		if compared == 0 {
+			m.size += memNodeSize(key, value) - memNodeSize(key, x.value)
+			x.tombstone = tombstone
+			x.value = bytes.Clone(value)
+			return
+		}
+		if compared < 0 {
+			x = x.left
+		} else {
+			x = x.right
+		}
+	}
+	n := &memNode{key: bytes.Clone(key), value: bytes.Clone(value), tombstone: tombstone}
+	n.parent = y
+	if y == m.leaf {
+		m.root = n
+	} else if compared < 0 {
+		y.left = n
+	} else {
+		y.right = n
+	}
+	n.left = m.leaf
+	n.right = m.leaf
+	n.color = red
+	m.size += memNodeSize(n.key, n.value)
+	m.insertFixup(n)
+}
+
+const memNodeOverhead = int(unsafe.Sizeof(memNode{}))
+
+// memNodeSize gets the approximate amount of memory allocated for the node
+func memNodeSize(key, value []byte) int {
+	return memNodeOverhead + len(key) + len(value)
 }
