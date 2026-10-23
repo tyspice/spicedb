@@ -73,14 +73,12 @@ func (m *memtable) Size() int {
 	return m.size
 }
 
-// TODO
 // NewIterator returns an iterator over all entries, tombstones included,
-// in ascending key order.
+// in ascending key order. Only iterate frozen memtables
 func (m *memtable) NewIterator() *memIterator {
-	return &memIterator{}
+	return &memIterator{m: m, curr: nil}
 }
 
-// TODO
 // memIterator walks a memtable's entries in ascending key order.
 // Typical use:
 //
@@ -88,28 +86,54 @@ func (m *memtable) NewIterator() *memIterator {
 //	for it.Next() {
 //		k, v, tomb := it.Key(), it.Value(), it.Tombstone()
 //	}
-type memIterator struct{}
+type memIterator struct {
+	m    *memtable
+	curr *memNode
+}
 
-// TODO
 // Next advances to the next entry and reports whether there is one.
 // It must be called before the first Key/Value/Tombstone call.
 func (it *memIterator) Next() bool {
-	return false
+	if it.curr == it.m.leaf {
+		return false
+	}
+	if it.curr == nil {
+		it.curr = it.m.minimum(it.m.root)
+	} else {
+		if it.curr.right != it.m.leaf {
+			it.curr = it.m.minimum(it.curr.right)
+		} else {
+			y := it.curr.parent
+			for y != it.m.leaf && it.curr == y.right {
+				it.curr = y
+				y = y.parent
+			}
+			it.curr = y
+		}
+	}
+	return it.curr != it.m.leaf
 }
 
-// TODO
 func (it *memIterator) Key() []byte {
-	return nil
+	return it.curr.key
 }
 
-// TODO
 func (it *memIterator) Value() []byte {
-	return nil
+	return it.curr.value
 }
 
-// TODO
 func (it *memIterator) Tombstone() bool {
-	return false
+	return it.curr.tombstone
+}
+
+func (m *memtable) minimum(n *memNode) *memNode {
+	if n == m.leaf {
+		return n
+	}
+	for n.left != m.leaf {
+		n = n.left
+	}
+	return n
 }
 
 // the caller must hold m.mu
