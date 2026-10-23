@@ -32,6 +32,7 @@ func newMemtable() *memtable {
 	return &memtable{root: leaf, leaf: leaf}
 }
 
+// TODO
 // Get looks up key. found reports whether the memtable has an entry for key;
 // deleted reports whether that entry is a tombstone. When found is false,
 // the caller should check older memtables and SSTables.
@@ -40,24 +41,30 @@ func (m *memtable) Get(key []byte) (value []byte, deleted bool, found bool) {
 }
 
 func (m *memtable) Put(key, value []byte) {
-
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.insertOrDelete(key, value, false)
 }
 
 func (m *memtable) Delete(key []byte) {
-
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.insertOrDelete(key, nil, true)
 }
 
 // Size returns the approximate number of bytes held by the memtable.
 func (m *memtable) Size() int {
-	return 0
+	return m.size
 }
 
+// TODO
 // NewIterator returns an iterator over all entries, tombstones included,
 // in ascending key order.
 func (m *memtable) NewIterator() *memIterator {
 	return &memIterator{}
 }
 
+// TODO
 // memIterator walks a memtable's entries in ascending key order.
 // Typical use:
 //
@@ -67,20 +74,24 @@ func (m *memtable) NewIterator() *memIterator {
 //	}
 type memIterator struct{}
 
+// TODO
 // Next advances to the next entry and reports whether there is one.
 // It must be called before the first Key/Value/Tombstone call.
 func (it *memIterator) Next() bool {
 	return false
 }
 
+// TODO
 func (it *memIterator) Key() []byte {
 	return nil
 }
 
+// TODO
 func (it *memIterator) Value() []byte {
 	return nil
 }
 
+// TODO
 func (it *memIterator) Tombstone() bool {
 	return false
 }
