@@ -54,6 +54,8 @@ func (m *memtable) Delete(key []byte) {
 
 // Size returns the approximate number of bytes held by the memtable.
 func (m *memtable) Size() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.size
 }
 
