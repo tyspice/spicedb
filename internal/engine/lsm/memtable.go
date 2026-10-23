@@ -82,16 +82,87 @@ func (it *memIterator) Tombstone() bool {
 }
 
 // the caller must hold m.mu
-func (m *memtable) rotateLeft(n *memNode) {
-
+func (m *memtable) rotateLeft(x *memNode) {
+	// set y
+	y := x.right
+	// turn y's left subtree into x's right subtree
+	x.right = y.left
+	if y.left != m.leaf {
+		y.left.parent = x
+	}
+	// link x's parent to y
+	y.parent = x.parent
+	if x.parent == m.leaf {
+		m.root = y
+	} else if x == x.parent.left {
+		x.parent.left = y
+	} else {
+		x.parent.right = y
+	}
+	// put x on y's left
+	y.left = x
+	x.parent = y
 }
 
 // the caller must hold m.mu
-func (m *memtable) rotateRight(n *memNode) {
-
+func (m *memtable) rotateRight(x *memNode) {
+	// set y
+	y := x.left
+	// turn y's right subtree into x's left subtree
+	x.left = y.right
+	if y.right != m.leaf {
+		y.right.parent = x
+	}
+	// link x's parent to y
+	y.parent = x.parent
+	if x.parent == m.leaf {
+		m.root = y
+	} else if x == x.parent.right {
+		x.parent.right = y
+	} else {
+		x.parent.left = y
+	}
+	// put x on y's right
+	y.right = x
+	x.parent = y
 }
 
 // the caller must hold m.mu
-func (m *memtable) insertFixup(n *memNode) {
-
+func (m *memtable) insertFixup(z *memNode) {
+	for z.parent.color == red {
+		if z.parent == z.parent.parent.left {
+			y := z.parent.parent.right
+			if y.color == red {
+				z.parent.color = black
+				y.color = black
+				z.parent.parent.color = red
+				z = z.parent.parent
+			} else {
+				if z == z.parent.right {
+					z = z.parent
+					m.rotateLeft(z)
+				}
+				z.parent.color = black
+				z.parent.parent.color = red
+				m.rotateRight(z.parent.parent)
+			}
+		} else {
+			y := z.parent.parent.left
+			if y.color == red {
+				z.parent.color = black
+				y.color = black
+				z.parent.parent.color = red
+				z = z.parent.parent
+			} else {
+				if z == z.parent.left {
+					z = z.parent
+					m.rotateRight(z)
+				}
+				z.parent.color = black
+				z.parent.parent.color = red
+				m.rotateLeft(z.parent.parent)
+			}
+		}
+	}
+	m.root.color = black
 }
