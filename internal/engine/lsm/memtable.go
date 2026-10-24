@@ -126,6 +126,11 @@ func (it *memIterator) Tombstone() bool {
 	return it.curr.tombstone
 }
 
+// This is just to satisfy the entryIterator implementation
+func (it *memIterator) Err() error {
+	return nil
+}
+
 func (m *memtable) minimum(n *memNode) *memNode {
 	if n == m.leaf {
 		return n

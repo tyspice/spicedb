@@ -17,6 +17,4 @@ func (it *sstIterator) Next() bool
 func (it *sstIterator) Key() []byte
 func (it *sstIterator) Value() []byte
 func (it *sstIterator) Tombstone() bool
-func (it *sstIterator) Err() error // Next() returns false on error too, so the caller checks this
-
-// TODO also need to create a merging iterator that takes several sstIterator's and produces a sorted stream
+func (it *sstIterator) Err() error

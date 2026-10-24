@@ -8,6 +8,7 @@ type entryIterator interface {
 	Key() []byte
 	Value() []byte
 	Tombstone() bool
+	Err() error
 }
 
 // Compile-time check that *lsm implements engine.Engine.
