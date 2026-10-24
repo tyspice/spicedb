@@ -3,6 +3,13 @@ package lsm
 
 import "github.com/tyspice/spicedb/internal/engine"
 
+type entryIterator interface {
+	Next() bool
+	Key() []byte
+	Value() []byte
+	Tombstone() bool
+}
+
 // Compile-time check that *lsm implements engine.Engine.
 var _ engine.Engine = (*lsm)(nil)
 
