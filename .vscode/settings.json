@@ -1,6 +1,7 @@
 {
   "cSpell.words": [
     "memtable",
-    "spicedb"
+    "spicedb",
+    "sstable"
   ]
 }
