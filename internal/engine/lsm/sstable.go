@@ -1,16 +1,18 @@
 // SSTable file format (all fixed-width integers little-endian):
 //
-//   data block:  repeated { uvarint keyLen | uvarint valLen | byte flags | key | value }
+//   data block:  repeated { uvarint keyLen | uvarint valLen | flags | key | value }
 //   index block: repeated { uvarint keyLen | key | uint64 offset }
 //   footer:      uint64 indexOffset | [8]byte magic "SPICEDB!"
 
 package lsm
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"io"
 	"os"
+	"sort"
 )
 
 const (
@@ -33,17 +35,24 @@ const (
 	foundTombstone
 )
 
+type flag int8
+
+const (
+	delete flag = iota
+	put
+)
+
 type indexEntry struct {
 	key    []byte
 	offset int64
-	length int64
 }
 
 type sstReader struct {
-	r     io.ReaderAt
-	c     io.Closer // nil if caller manages the lifetime
-	size  int64
-	index []indexEntry
+	r           io.ReaderAt
+	c           io.Closer // nil if caller manages the lifetime
+	size        int64
+	indexOffset int64
+	index       []indexEntry
 }
 
 func openSSTable(r io.ReaderAt, size int64) (*sstReader, error) {
@@ -71,24 +80,23 @@ func openSSTable(r io.ReaderAt, size int64) (*sstReader, error) {
 	}
 
 	var indexEntries []indexEntry
-	var buf []byte
 	for pos := 0; pos < int(indexSize); {
-		keyLen, n := binary.Uvarint(buf[pos:])
+		keyLen, n := binary.Uvarint(indexBytes[pos:])
 		if n <= 0 {
 			return nil, errors.New("lsm: corrupt index (keyLen)")
 		}
 		pos += n
-		if uint64(len(buf)-pos) < keyLen+8 {
+		if uint64(len(indexBytes)-pos) < keyLen+8 {
 			return nil, errors.New("lsm: corrupt index (truncated)")
 		}
-		key := buf[pos : pos+int(keyLen)]
+		key := indexBytes[pos : pos+int(keyLen)]
 		pos += int(keyLen)
-		offset := int64(byteOrder.Uint64(buf[pos:]))
+		offset := int64(byteOrder.Uint64(indexBytes[pos:]))
 		pos += 8
 		indexEntries = append(indexEntries, indexEntry{key: key, offset: offset})
 	}
 
-	return &sstReader{r: r, c: nil, size: size, index: indexEntries}, nil
+	return &sstReader{r: r, c: nil, size: size, indexOffset: indexOffset, index: indexEntries}, nil
 }
 
 // openSSTableFile opens path and takes ownership of the file.
@@ -111,8 +119,74 @@ func openSSTableFile(path string) (*sstReader, error) {
 	return t, nil
 }
 
-// TODO
-func (t *sstReader) get(key []byte) ([]byte, lookupResult, error)
+func (t *sstReader) get(key []byte) ([]byte, lookupResult, error) {
+	i := sort.Search(len(t.index), func(i int) bool {
+		return bytes.Compare(t.index[i].key, key) > 0
+	})
+	if i == 0 {
+		return nil, notFound, nil
+	}
+
+	start := t.index[i-1].offset
+	var end int64
+	if i < len(t.index) {
+		end = t.index[i].offset
+	} else {
+		end = t.indexOffset
+	}
+
+	dataBlock := make([]byte, end-start)
+	if _, err := t.r.ReadAt(dataBlock, start); err != nil {
+		return nil, notFound, err
+	}
+
+	for pos := 0; pos < len(dataBlock); {
+		keyLen, n := binary.Uvarint(dataBlock[pos:])
+		if n <= 0 {
+			return nil, notFound, errors.New("lsm: corrupt data block (keyLen)")
+		}
+		pos += n
+
+		valLen, n := binary.Uvarint(dataBlock[pos:])
+		if n <= 0 {
+			return nil, notFound, errors.New("lsm: corrupt data block (valLen)")
+		}
+		pos += n
+
+		if pos >= len(dataBlock) {
+			return nil, notFound, errors.New("lsm: corrupt data block (flags)")
+		}
+		flag := dataBlock[pos]
+		pos++
+
+		if uint64(len(dataBlock)-pos) < keyLen+valLen {
+			return nil, notFound, errors.New("lsm: corrupt data block (truncated)")
+		}
+
+		k := dataBlock[pos : pos+int(keyLen)]
+		pos += int(keyLen)
+
+		switch c := bytes.Compare(k, key); {
+		case c == 0:
+			if flag == byte(delete) {
+				return nil, foundTombstone, nil
+			}
+			return dataBlock[pos : pos+int(valLen)], found, nil
+		case c > 0:
+			return nil, notFound, nil
+		}
+		pos += int(valLen)
+	}
+
+	return nil, notFound, nil
+}
+
+func (t *sstReader) close() error {
+	if t.c == nil {
+		return nil
+	}
+	return t.c.Close()
+}
 
 // TODO
 func writeSSTable(w io.Writer, iter entryIterator) error {
