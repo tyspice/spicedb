@@ -7,6 +7,7 @@
 package lsm
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"errors"
@@ -16,11 +17,11 @@ import (
 )
 
 const (
-	sstMagicNumber = "SPICEDB!"
-
+	sstMagicNumber             = "SPICEDB!"
 	footerIndexOffsetPos       = 0
 	footerMagicPos             = 8
 	footerSize           int64 = 16
+	blockSize                  = 4096 // 4KB
 )
 
 // All fixed-width integers in sstable files use this order. Never call
@@ -35,11 +36,11 @@ const (
 	foundTombstone
 )
 
-type flag int8
+type flag byte
 
 const (
-	delete flag = iota
-	put
+	flagDelete flag = iota
+	flagPut
 )
 
 type indexEntry struct {
@@ -112,7 +113,7 @@ func openSSTableFile(path string) (*sstReader, error) {
 	}
 	t, err := openSSTable(f, fi.Size())
 	if err != nil {
-		t.c.Close()
+		f.Close()
 		return nil, err
 	}
 	t.c = f
@@ -168,7 +169,7 @@ func (t *sstReader) get(key []byte) ([]byte, lookupResult, error) {
 
 		switch c := bytes.Compare(k, key); {
 		case c == 0:
-			if flag == byte(delete) {
+			if flag == byte(flagDelete) {
 				return nil, foundTombstone, nil
 			}
 			return dataBlock[pos : pos+int(valLen)], found, nil
@@ -188,9 +189,52 @@ func (t *sstReader) close() error {
 	return t.c.Close()
 }
 
-// TODO
 func writeSSTable(w io.Writer, iter entryIterator) error {
-	return nil
+	bw := bufio.NewWriter(w)
+	indexEntries := []indexEntry{}
+	offset := 0
+	currentBlock := 0
+
+	var hdr [2*binary.MaxVarintLen64 + 1]byte
+	for iter.Next() {
+		key, value, tombstone := iter.Key(), iter.Value(), iter.Tombstone()
+		if offset == 0 || currentBlock >= blockSize {
+			indexEntries = append(indexEntries, indexEntry{key: bytes.Clone(key), offset: int64(offset)})
+			currentBlock = 0
+		}
+
+		f := flagPut
+		if tombstone {
+			f = flagDelete
+		}
+
+		h := binary.AppendUvarint(hdr[:0], uint64(len(key)))
+		h = binary.AppendUvarint(h, uint64(len(value)))
+		h = append(h, byte(f))
+		bw.Write(h)
+		bw.Write(key)
+		if _, err := bw.Write(value); err != nil {
+			return err
+		}
+
+		n := len(h) + len(key) + len(value)
+		offset += n
+		currentBlock += n
+	}
+	if err := iter.Err(); err != nil {
+		return err
+	}
+
+	var ibuf []byte
+	for _, e := range indexEntries {
+		ibuf = binary.AppendUvarint(ibuf[:0], uint64(len(e.key)))
+		ibuf = append(ibuf, e.key...)
+		ibuf = byteOrder.AppendUint64(ibuf, uint64(e.offset))
+		bw.Write(ibuf)
+	}
+
+	bw.Write(appendFooter(hdr[:0], uint64(offset)))
+	return bw.Flush()
 }
 
 // TODO
@@ -204,11 +248,9 @@ func (it *sstIterator) Value() []byte
 func (it *sstIterator) Tombstone() bool
 func (it *sstIterator) Err() error
 
-func encodeFooter(indexOffset int64) [footerSize]byte {
-	var buf [footerSize]byte
-	byteOrder.PutUint64(buf[footerIndexOffsetPos:], uint64(indexOffset))
-	copy(buf[footerMagicPos:], []byte(sstMagicNumber))
-	return buf
+func appendFooter(b []byte, indexOffset uint64) []byte {
+	b = byteOrder.AppendUint64(b, indexOffset)
+	return append(b, sstMagicNumber...)
 }
 
 func decodeFooter(buf []byte) (indexOffset int64, err error) {
