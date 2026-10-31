@@ -1,6 +1,6 @@
 // SSTable file format (all fixed-width integers little-endian):
 //
-//   data block:  repeated { uvarint keyLen | uvarint valLen | flags | key | value }
+//   data block:  repeated { uvarint keyLen | uvarint valLen | kind | key | value }
 //   index block: repeated { uvarint keyLen | key | uint64 offset }
 //   footer:      uint64 indexOffset | [8]byte magic "SPICEDB!"
 
@@ -36,11 +36,11 @@ const (
 	foundTombstone
 )
 
-type flag byte
+type entryKind byte
 
 const (
-	flagDelete flag = iota
-	flagPut
+	kindDelete entryKind = iota
+	kindPut
 )
 
 type indexEntry struct {
@@ -150,14 +150,14 @@ func (t *sstReader) Get(key []byte) ([]byte, lookupResult, error) {
 	}
 
 	for pos := 0; pos < len(dataBlock); {
-		k, v, flagType, n, err := decodeDataEntry(dataBlock[pos:])
+		k, v, kind, n, err := decodeDataEntry(dataBlock[pos:])
 		if err != nil {
 			return nil, notFound, err
 		}
 
 		switch c := bytes.Compare(k, key); {
 		case c == 0:
-			if flagType == flagDelete {
+			if kind == kindDelete {
 				return nil, foundTombstone, nil
 			}
 			return v, found, nil
@@ -191,14 +191,14 @@ func writeSSTable(w io.Writer, iter entryIterator) error {
 			currentBlock = 0
 		}
 
-		f := flagPut
+		kind := kindPut
 		if tombstone {
-			f = flagDelete
+			kind = kindDelete
 		}
 
 		h := binary.AppendUvarint(hdr[:0], uint64(len(key)))
 		h = binary.AppendUvarint(h, uint64(len(value)))
-		h = append(h, byte(f))
+		h = append(h, byte(kind))
 		bw.Write(h)
 		bw.Write(key)
 		if _, err := bw.Write(value); err != nil {
@@ -262,7 +262,7 @@ func (it *sstIterator) Next() bool {
 		it.nextIndexPos += 1
 	}
 
-	k, v, flagType, n, err := decodeDataEntry(it.dataBuff[it.offset:])
+	k, v, kind, n, err := decodeDataEntry(it.dataBuff[it.offset:])
 	if err != nil {
 		it.err = err
 		return false
@@ -270,7 +270,7 @@ func (it *sstIterator) Next() bool {
 
 	it.key = k
 	it.value = v
-	it.tombstone = flagType == flagDelete
+	it.tombstone = kind == kindDelete
 	it.offset += n
 
 	return true
@@ -306,29 +306,29 @@ func decodeFooter(buf []byte) (indexOffset int64, err error) {
 	return indexOffset, nil
 }
 
-func decodeDataEntry(dataBlock []byte) (key []byte, value []byte, f flag, bytesRead int, err error) {
+func decodeDataEntry(dataBlock []byte) (key []byte, value []byte, kind entryKind, bytesRead int, err error) {
 	pos := 0
 	keyLen, n := binary.Uvarint(dataBlock[pos:])
 	if n <= 0 {
-		return nil, nil, flagDelete, 0, errors.New("lsm: corrupt data block (keyLen)")
+		return nil, nil, kindDelete, 0, errors.New("lsm: corrupt data block (keyLen)")
 	}
 	pos += n
 
 	valLen, n := binary.Uvarint(dataBlock[pos:])
 	if n <= 0 {
-		return nil, nil, flagDelete, 0, errors.New("lsm: corrupt data block (valLen)")
+		return nil, nil, kindDelete, 0, errors.New("lsm: corrupt data block (valLen)")
 	}
 	pos += n
 
 	if pos >= len(dataBlock) {
-		return nil, nil, flagDelete, 0, errors.New("lsm: corrupt data block (flags)")
+		return nil, nil, kindDelete, 0, errors.New("lsm: corrupt data block (flags)")
 	}
-	f = flag(dataBlock[pos])
+	kind = entryKind(dataBlock[pos])
 	pos++
 
 	rem := uint64(len(dataBlock) - pos)
 	if keyLen > rem || valLen > rem-keyLen {
-		return nil, nil, flagDelete, 0, errors.New("lsm: corrupt data block (truncated)")
+		return nil, nil, kindDelete, 0, errors.New("lsm: corrupt data block (truncated)")
 	}
 
 	key = dataBlock[pos : pos+int(keyLen)]
@@ -337,5 +337,5 @@ func decodeDataEntry(dataBlock []byte) (key []byte, value []byte, f flag, bytesR
 	value = dataBlock[pos : pos+int(valLen)]
 	pos += int(valLen)
 
-	return key, value, f, pos, nil
+	return key, value, kind, pos, nil
 }
