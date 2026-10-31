@@ -1,6 +1,6 @@
 // SSTable file format (all fixed-width integers little-endian):
 //
-//   data block:  repeated { kind | uvarint keyLen | uvarint valLen | key | value }
+//   data block:  repeated data entry (see encoding.go)
 //   index block: repeated { uvarint keyLen | key | uint64 offset }
 //   footer:      uint64 indexOffset | [8]byte magic "SPICEDB!"
 
@@ -24,24 +24,12 @@ const (
 	blockSize                  = 4096 // 4KB
 )
 
-// All fixed-width integers in sstable files use this order. Never call
-// binary.BigEndian/LittleEndian directly elsewhere in this file.
-var byteOrder = binary.LittleEndian
-
 type lookupResult int
 
 const (
 	notFound lookupResult = iota
 	found
 	foundTombstone
-)
-
-type entryKind byte
-
-const (
-	kindDelete entryKind = iota
-	kindPut
-	numEntryKinds // must be last
 )
 
 type indexEntry struct {
@@ -299,49 +287,4 @@ func decodeFooter(buf []byte) (indexOffset int64, err error) {
 	}
 	indexOffset = int64(byteOrder.Uint64(buf[0:8]))
 	return indexOffset, nil
-}
-
-func appendDataEntry(b, key, value []byte, kind entryKind) []byte {
-	b = append(b, byte(kind))
-	b = binary.AppendUvarint(b, uint64(len(key)))
-	b = binary.AppendUvarint(b, uint64(len(value)))
-	b = append(b, key...)
-	return append(b, value...)
-}
-
-func decodeDataEntry(dataBlock []byte) (key []byte, value []byte, kind entryKind, bytesRead int, err error) {
-	if len(dataBlock) == 0 {
-		return nil, nil, kindDelete, 0, errors.New("lsm: corrupt data block (empty)")
-	}
-
-	kind = entryKind(dataBlock[0])
-	if kind >= numEntryKinds {
-		return nil, nil, kindDelete, 0, errors.New("lsm: corrupt data block (kind)")
-	}
-	pos := 1
-
-	keyLen, n := binary.Uvarint(dataBlock[pos:])
-	if n <= 0 {
-		return nil, nil, kindDelete, 0, errors.New("lsm: corrupt data block (keyLen)")
-	}
-	pos += n
-
-	valLen, n := binary.Uvarint(dataBlock[pos:])
-	if n <= 0 {
-		return nil, nil, kindDelete, 0, errors.New("lsm: corrupt data block (valLen)")
-	}
-	pos += n
-
-	rem := uint64(len(dataBlock) - pos)
-	if keyLen > rem || valLen > rem-keyLen {
-		return nil, nil, kindDelete, 0, errors.New("lsm: corrupt data block (truncated)")
-	}
-
-	key = dataBlock[pos : pos+int(keyLen)]
-	pos += int(keyLen)
-
-	value = dataBlock[pos : pos+int(valLen)]
-	pos += int(valLen)
-
-	return key, value, kind, pos, nil
 }
