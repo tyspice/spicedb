@@ -46,6 +46,7 @@ const (
 type indexEntry struct {
 	key    []byte
 	offset int64
+	size   int64
 }
 
 type sstReader struct {
@@ -74,6 +75,9 @@ func openSSTable(r io.ReaderAt, size int64) (*sstReader, error) {
 	}
 
 	indexSize := size - indexOffset - footerSize
+	if indexOffset < 0 || indexOffset > size-footerSize {
+		return nil, errors.New("lsm: corrupt footer (index offset)")
+	}
 
 	indexBytes := make([]byte, indexSize)
 	if _, err := r.ReadAt(indexBytes, indexOffset); err != nil {
@@ -95,6 +99,17 @@ func openSSTable(r io.ReaderAt, size int64) (*sstReader, error) {
 		offset := int64(byteOrder.Uint64(indexBytes[pos:]))
 		pos += 8
 		indexEntries = append(indexEntries, indexEntry{key: key, offset: offset})
+	}
+
+	for i := range indexEntries {
+		end := indexOffset
+		if i+1 < len(indexEntries) {
+			end = indexEntries[i+1].offset
+		}
+		indexEntries[i].size = end - indexEntries[i].offset
+		if indexEntries[i].offset < 0 || indexEntries[i].size < 0 {
+			return nil, errors.New("lsm: corrupt index (offsets)")
+		}
 	}
 
 	return &sstReader{r: r, c: nil, size: size, indexOffset: indexOffset, index: indexEntries}, nil
@@ -120,7 +135,7 @@ func openSSTableFile(path string) (*sstReader, error) {
 	return t, nil
 }
 
-func (t *sstReader) get(key []byte) ([]byte, lookupResult, error) {
+func (t *sstReader) Get(key []byte) ([]byte, lookupResult, error) {
 	i := sort.Search(len(t.index), func(i int) bool {
 		return bytes.Compare(t.index[i].key, key) > 0
 	})
@@ -128,61 +143,34 @@ func (t *sstReader) get(key []byte) ([]byte, lookupResult, error) {
 		return nil, notFound, nil
 	}
 
-	start := t.index[i-1].offset
-	var end int64
-	if i < len(t.index) {
-		end = t.index[i].offset
-	} else {
-		end = t.indexOffset
-	}
-
-	dataBlock := make([]byte, end-start)
-	if _, err := t.r.ReadAt(dataBlock, start); err != nil {
+	e := t.index[i-1]
+	dataBlock := make([]byte, e.size)
+	if _, err := t.r.ReadAt(dataBlock, e.offset); err != nil {
 		return nil, notFound, err
 	}
 
 	for pos := 0; pos < len(dataBlock); {
-		keyLen, n := binary.Uvarint(dataBlock[pos:])
-		if n <= 0 {
-			return nil, notFound, errors.New("lsm: corrupt data block (keyLen)")
+		k, v, flagType, n, err := decodeDataEntry(dataBlock[pos:])
+		if err != nil {
+			return nil, notFound, err
 		}
-		pos += n
-
-		valLen, n := binary.Uvarint(dataBlock[pos:])
-		if n <= 0 {
-			return nil, notFound, errors.New("lsm: corrupt data block (valLen)")
-		}
-		pos += n
-
-		if pos >= len(dataBlock) {
-			return nil, notFound, errors.New("lsm: corrupt data block (flags)")
-		}
-		flag := dataBlock[pos]
-		pos++
-
-		if uint64(len(dataBlock)-pos) < keyLen+valLen {
-			return nil, notFound, errors.New("lsm: corrupt data block (truncated)")
-		}
-
-		k := dataBlock[pos : pos+int(keyLen)]
-		pos += int(keyLen)
 
 		switch c := bytes.Compare(k, key); {
 		case c == 0:
-			if flag == byte(flagDelete) {
+			if flagType == flagDelete {
 				return nil, foundTombstone, nil
 			}
-			return dataBlock[pos : pos+int(valLen)], found, nil
+			return v, found, nil
 		case c > 0:
 			return nil, notFound, nil
 		}
-		pos += int(valLen)
+		pos += n
 	}
 
 	return nil, notFound, nil
 }
 
-func (t *sstReader) close() error {
+func (t *sstReader) Close() error {
 	if t.c == nil {
 		return nil
 	}
@@ -237,16 +225,72 @@ func writeSSTable(w io.Writer, iter entryIterator) error {
 	return bw.Flush()
 }
 
-// TODO
-type sstIterator struct{}
+type sstIterator struct {
+	sstr         *sstReader
+	nextIndexPos int
+	dataBuff     []byte
+	offset       int
+	key          []byte
+	value        []byte
+	tombstone    bool
+	err          error
+}
 
-// TODO
-func newSSTableIterator(r io.ReaderAt, size int64) (*sstIterator, error)
-func (it *sstIterator) Next() bool
-func (it *sstIterator) Key() []byte
-func (it *sstIterator) Value() []byte
-func (it *sstIterator) Tombstone() bool
-func (it *sstIterator) Err() error
+func (t *sstReader) NewIterator() *sstIterator {
+	return &sstIterator{sstr: t}
+}
+
+func (it *sstIterator) Next() bool {
+	if it.err != nil {
+		return false
+	}
+
+	// if we're at the end of the data buffer then load the next block
+	if it.offset >= len(it.dataBuff) {
+		if it.nextIndexPos >= len(it.sstr.index) {
+			return false
+		}
+		e := it.sstr.index[it.nextIndexPos]
+		// This adds an extra allocation per index entry so there's an opportunity to optimize
+		buf := make([]byte, e.size)
+		if _, err := it.sstr.r.ReadAt(buf, e.offset); err != nil {
+			it.err = err
+			return false
+		}
+		it.dataBuff = buf
+		it.offset = 0
+		it.nextIndexPos += 1
+	}
+
+	k, v, flagType, n, err := decodeDataEntry(it.dataBuff[it.offset:])
+	if err != nil {
+		it.err = err
+		return false
+	}
+
+	it.key = k
+	it.value = v
+	it.tombstone = flagType == flagDelete
+	it.offset += n
+
+	return true
+}
+
+func (it *sstIterator) Key() []byte {
+	return it.key
+}
+
+func (it *sstIterator) Value() []byte {
+	return it.value
+}
+
+func (it *sstIterator) Tombstone() bool {
+	return it.tombstone
+}
+
+func (it *sstIterator) Err() error {
+	return it.err
+}
 
 func appendFooter(b []byte, indexOffset uint64) []byte {
 	b = byteOrder.AppendUint64(b, indexOffset)
@@ -260,4 +304,38 @@ func decodeFooter(buf []byte) (indexOffset int64, err error) {
 	}
 	indexOffset = int64(byteOrder.Uint64(buf[0:8]))
 	return indexOffset, nil
+}
+
+func decodeDataEntry(dataBlock []byte) (key []byte, value []byte, f flag, bytesRead int, err error) {
+	pos := 0
+	keyLen, n := binary.Uvarint(dataBlock[pos:])
+	if n <= 0 {
+		return nil, nil, flagDelete, 0, errors.New("lsm: corrupt data block (keyLen)")
+	}
+	pos += n
+
+	valLen, n := binary.Uvarint(dataBlock[pos:])
+	if n <= 0 {
+		return nil, nil, flagDelete, 0, errors.New("lsm: corrupt data block (valLen)")
+	}
+	pos += n
+
+	if pos >= len(dataBlock) {
+		return nil, nil, flagDelete, 0, errors.New("lsm: corrupt data block (flags)")
+	}
+	f = flag(dataBlock[pos])
+	pos++
+
+	rem := uint64(len(dataBlock) - pos)
+	if keyLen > rem || valLen > rem-keyLen {
+		return nil, nil, flagDelete, 0, errors.New("lsm: corrupt data block (truncated)")
+	}
+
+	key = dataBlock[pos : pos+int(keyLen)]
+	pos += int(keyLen)
+
+	value = dataBlock[pos : pos+int(valLen)]
+	pos += int(valLen)
+
+	return key, value, f, pos, nil
 }
