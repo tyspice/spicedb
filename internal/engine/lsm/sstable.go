@@ -1,6 +1,6 @@
 // SSTable file format (all fixed-width integers little-endian):
 //
-//   data block:  repeated { uvarint keyLen | uvarint valLen | kind | key | value }
+//   data block:  repeated { kind | uvarint keyLen | uvarint valLen | key | value }
 //   index block: repeated { uvarint keyLen | key | uint64 offset }
 //   footer:      uint64 indexOffset | [8]byte magic "SPICEDB!"
 
@@ -41,6 +41,7 @@ type entryKind byte
 const (
 	kindDelete entryKind = iota
 	kindPut
+	numEntryKinds // must be last
 )
 
 type indexEntry struct {
@@ -183,7 +184,7 @@ func writeSSTable(w io.Writer, iter entryIterator) error {
 	offset := 0
 	currentBlock := 0
 
-	var hdr [2*binary.MaxVarintLen64 + 1]byte
+	var buf []byte
 	for iter.Next() {
 		key, value, tombstone := iter.Key(), iter.Value(), iter.Tombstone()
 		if offset == 0 || currentBlock >= blockSize {
@@ -196,32 +197,26 @@ func writeSSTable(w io.Writer, iter entryIterator) error {
 			kind = kindDelete
 		}
 
-		h := binary.AppendUvarint(hdr[:0], uint64(len(key)))
-		h = binary.AppendUvarint(h, uint64(len(value)))
-		h = append(h, byte(kind))
-		bw.Write(h)
-		bw.Write(key)
-		if _, err := bw.Write(value); err != nil {
+		buf = appendDataEntry(buf[:0], key, value, kind)
+		if _, err := bw.Write(buf); err != nil {
 			return err
 		}
 
-		n := len(h) + len(key) + len(value)
-		offset += n
-		currentBlock += n
+		offset += len(buf)
+		currentBlock += len(buf)
 	}
 	if err := iter.Err(); err != nil {
 		return err
 	}
 
-	var ibuf []byte
 	for _, e := range indexEntries {
-		ibuf = binary.AppendUvarint(ibuf[:0], uint64(len(e.key)))
-		ibuf = append(ibuf, e.key...)
-		ibuf = byteOrder.AppendUint64(ibuf, uint64(e.offset))
-		bw.Write(ibuf)
+		buf = binary.AppendUvarint(buf[:0], uint64(len(e.key)))
+		buf = append(buf, e.key...)
+		buf = byteOrder.AppendUint64(buf, uint64(e.offset))
+		bw.Write(buf)
 	}
 
-	bw.Write(appendFooter(hdr[:0], uint64(offset)))
+	bw.Write(appendFooter(buf[:0], uint64(offset)))
 	return bw.Flush()
 }
 
@@ -306,8 +301,25 @@ func decodeFooter(buf []byte) (indexOffset int64, err error) {
 	return indexOffset, nil
 }
 
+func appendDataEntry(b, key, value []byte, kind entryKind) []byte {
+	b = append(b, byte(kind))
+	b = binary.AppendUvarint(b, uint64(len(key)))
+	b = binary.AppendUvarint(b, uint64(len(value)))
+	b = append(b, key...)
+	return append(b, value...)
+}
+
 func decodeDataEntry(dataBlock []byte) (key []byte, value []byte, kind entryKind, bytesRead int, err error) {
-	pos := 0
+	if len(dataBlock) == 0 {
+		return nil, nil, kindDelete, 0, errors.New("lsm: corrupt data block (empty)")
+	}
+
+	kind = entryKind(dataBlock[0])
+	if kind >= numEntryKinds {
+		return nil, nil, kindDelete, 0, errors.New("lsm: corrupt data block (kind)")
+	}
+	pos := 1
+
 	keyLen, n := binary.Uvarint(dataBlock[pos:])
 	if n <= 0 {
 		return nil, nil, kindDelete, 0, errors.New("lsm: corrupt data block (keyLen)")
@@ -319,12 +331,6 @@ func decodeDataEntry(dataBlock []byte) (key []byte, value []byte, kind entryKind
 		return nil, nil, kindDelete, 0, errors.New("lsm: corrupt data block (valLen)")
 	}
 	pos += n
-
-	if pos >= len(dataBlock) {
-		return nil, nil, kindDelete, 0, errors.New("lsm: corrupt data block (flags)")
-	}
-	kind = entryKind(dataBlock[pos])
-	pos++
 
 	rem := uint64(len(dataBlock) - pos)
 	if keyLen > rem || valLen > rem-keyLen {
