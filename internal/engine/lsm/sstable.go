@@ -166,6 +166,8 @@ func (t *sstReader) Close() error {
 	return t.c.Close()
 }
 
+// This function doesn't sync the resultant file so the
+// caller is responsible for ensuring file durability before closing
 func writeSSTable(w io.Writer, iter entryIterator) error {
 	bw := bufio.NewWriter(w)
 	indexEntries := []indexEntry{}
