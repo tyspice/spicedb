@@ -2,7 +2,8 @@
 //
 //   data block:  repeated data entry (see encoding.go)
 //   index block: repeated { uvarint keyLen | key | uint64 offset }
-//   footer:      uint64 indexOffset | [8]byte magic "SPICEDB!"
+//   filter block : TBD
+//   footer:      uint64 indexOffset | uint64 filterOffset | [8]byte magic "SPICEDB!"
 
 package lsm
 
@@ -19,8 +20,9 @@ import (
 const (
 	sstMagicNumber             = "SPICEDB!"
 	footerIndexOffsetPos       = 0
-	footerMagicPos             = 8
-	footerSize           int64 = 16
+	footerFilterPos            = 8
+	footerMagicPos             = 16
+	footerSize           int64 = 24
 	blockSize                  = 4096 // 4KB
 )
 
@@ -58,15 +60,16 @@ func openSSTable(r io.ReaderAt, size int64) (*sstReader, error) {
 		return nil, err
 	}
 
-	indexOffset, err := decodeFooter(footerBytes)
+	indexOffset, filterOffset, err := decodeFooter(footerBytes)
 	if err != nil {
 		return nil, err
 	}
 
-	indexSize := size - indexOffset - footerSize
-	if indexOffset < 0 || indexOffset > size-footerSize {
-		return nil, errors.New("lsm: corrupt footer (index offset)")
+	if indexOffset < 0 || filterOffset < indexOffset || filterOffset > size-footerSize {
+		return nil, errors.New("lsm: corrupt footer")
 	}
+
+	indexSize := filterOffset - indexOffset
 
 	indexBytes := make([]byte, indexSize)
 	if _, err := r.ReadAt(indexBytes, indexOffset); err != nil {
@@ -100,6 +103,8 @@ func openSSTable(r io.ReaderAt, size int64) (*sstReader, error) {
 			return nil, errors.New("lsm: corrupt index (offsets)")
 		}
 	}
+
+	// TODO: generate an in memory filter from the filter section
 
 	return &sstReader{r: r, c: nil, size: size, indexOffset: indexOffset, index: indexEntries}, nil
 }
@@ -177,6 +182,7 @@ func writeSSTable(w io.Writer, iter entryIterator) error {
 	var buf []byte
 	for iter.Next() {
 		key, value, tombstone := iter.Key(), iter.Value(), iter.Tombstone()
+		// TODO add key to bloom filter
 		if offset == 0 || currentBlock >= blockSize {
 			indexEntries = append(indexEntries, indexEntry{key: bytes.Clone(key), offset: int64(offset)})
 			currentBlock = 0
@@ -198,15 +204,20 @@ func writeSSTable(w io.Writer, iter entryIterator) error {
 	if err := iter.Err(); err != nil {
 		return err
 	}
+	indexOffset := uint64(offset)
 
 	for _, e := range indexEntries {
 		buf = binary.AppendUvarint(buf[:0], uint64(len(e.key)))
 		buf = append(buf, e.key...)
 		buf = byteOrder.AppendUint64(buf, uint64(e.offset))
 		bw.Write(buf)
+		offset += len(buf)
 	}
+	filterOffset := uint64(offset)
 
-	bw.Write(appendFooter(buf[:0], uint64(offset)))
+	// TODO: append m, k, and bits of bloom filter
+
+	bw.Write(appendFooter(buf[:0], indexOffset, filterOffset))
 	return bw.Flush()
 }
 
@@ -277,16 +288,18 @@ func (it *sstIterator) Err() error {
 	return it.err
 }
 
-func appendFooter(b []byte, indexOffset uint64) []byte {
+func appendFooter(b []byte, indexOffset uint64, filterOffset uint64) []byte {
 	b = byteOrder.AppendUint64(b, indexOffset)
+	b = byteOrder.AppendUint64(b, filterOffset)
 	return append(b, sstMagicNumber...)
 }
 
-func decodeFooter(buf []byte) (indexOffset int64, err error) {
+func decodeFooter(buf []byte) (indexOffset int64, filterOffset int64, err error) {
 	// first check the file integrity
-	if string(buf[8:16]) != sstMagicNumber {
-		return 0, errors.New("lsm: not sstable (bad magic)")
+	if string(buf[footerMagicPos:footerSize]) != sstMagicNumber {
+		return 0, 0, errors.New("lsm: not sstable (bad magic)")
 	}
-	indexOffset = int64(byteOrder.Uint64(buf[0:8]))
-	return indexOffset, nil
+	indexOffset = int64(byteOrder.Uint64(buf[footerIndexOffsetPos:footerFilterPos]))
+	filterOffset = int64(byteOrder.Uint64(buf[footerFilterPos:footerMagicPos]))
+	return indexOffset, filterOffset, nil
 }
