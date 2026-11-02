@@ -40,12 +40,36 @@ type indexEntry struct {
 	size   int64
 }
 
+type bloomFilter struct {
+	bits []uint64
+	m    uint64
+	k    uint64
+}
+
+// p = false positive rate
+func newBloomFilter(hashes []uint64, p float64) *bloomFilter {
+	// TODO
+	return &bloomFilter{}
+}
+
+func (f *bloomFilter) MayContain(key []byte) bool {
+	// we return true for anything if the filter is
+	// empty because we have no idea making the false
+	// positive rate 100%
+	if f.bits == nil {
+		return true
+	}
+	// TODO
+	return true
+}
+
 type sstReader struct {
 	r           io.ReaderAt
 	c           io.Closer // nil if caller manages the lifetime
 	size        int64
 	indexOffset int64
 	index       []indexEntry
+	filter      *bloomFilter
 }
 
 func openSSTable(r io.ReaderAt, size int64) (*sstReader, error) {
@@ -104,9 +128,19 @@ func openSSTable(r io.ReaderAt, size int64) (*sstReader, error) {
 		}
 	}
 
-	// TODO: generate an in memory filter from the filter section
+	filterSize := size - filterOffset - footerSize
 
-	return &sstReader{r: r, c: nil, size: size, indexOffset: indexOffset, index: indexEntries}, nil
+	filterBytes := make([]byte, filterSize)
+	if _, err := r.ReadAt(filterBytes, filterOffset); err != nil {
+		return nil, err
+	}
+
+	filter, err := decodeBloomFilter(filterBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	return &sstReader{r: r, c: nil, size: size, indexOffset: indexOffset, index: indexEntries, filter: filter}, nil
 }
 
 // openSSTableFile opens path and takes ownership of the file.
@@ -171,10 +205,15 @@ func (t *sstReader) Close() error {
 	return t.c.Close()
 }
 
+func (t *sstReader) MayContain(key []byte) bool {
+	return t.filter.MayContain(key)
+}
+
 // This function doesn't sync the resultant file so the
 // caller is responsible for ensuring file durability before closing
 func writeSSTable(w io.Writer, iter entryIterator) error {
 	bw := bufio.NewWriter(w)
+	var hashes []uint64
 	indexEntries := []indexEntry{}
 	offset := 0
 	currentBlock := 0
@@ -182,7 +221,7 @@ func writeSSTable(w io.Writer, iter entryIterator) error {
 	var buf []byte
 	for iter.Next() {
 		key, value, tombstone := iter.Key(), iter.Value(), iter.Tombstone()
-		// TODO add key to bloom filter
+		hashes = append(hashes, hashKey(key))
 		if offset == 0 || currentBlock >= blockSize {
 			indexEntries = append(indexEntries, indexEntry{key: bytes.Clone(key), offset: int64(offset)})
 			currentBlock = 0
@@ -215,8 +254,9 @@ func writeSSTable(w io.Writer, iter entryIterator) error {
 	}
 	filterOffset := uint64(offset)
 
-	// TODO: append m, k, and bits of bloom filter
-
+	// TODO decide where p is coming from (probably config or maybe caller)
+	filter := newBloomFilter(hashes, 0)
+	bw.Write(appendBloomFilter(buf[:0], filter))
 	bw.Write(appendFooter(buf[:0], indexOffset, filterOffset))
 	return bw.Flush()
 }
@@ -286,6 +326,21 @@ func (it *sstIterator) Tombstone() bool {
 
 func (it *sstIterator) Err() error {
 	return it.err
+}
+
+func appendBloomFilter(b []byte, f *bloomFilter) []byte {
+	// TODO
+	return b
+}
+
+func decodeBloomFilter(b []byte) (*bloomFilter, error) {
+	// TODO
+	return &bloomFilter{}, nil
+}
+
+func hashKey(key []byte) uint64 {
+	// TODO
+	return 0
 }
 
 func appendFooter(b []byte, indexOffset uint64, filterOffset uint64) []byte {
