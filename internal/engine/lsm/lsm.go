@@ -39,11 +39,12 @@ type lsm struct {
 	nextFileNum uint64
 }
 
-// TODO -add something that cleans up left over tmp files
-// TODO -if there's already an sst file with the same name as the number as the wal just delete the wal
-// TODO -open an sstReader for every sst file (including ones created by wal replay), ordered highest number first
-// TODO -create the active wal (nextFileNum), its walWriter, and an empty memtable and store them on l
-// TODO -add a start compaction process step before returning (Close must stop it and wait for it)
+// TODO - [x] add something that cleans up left over tmp files
+// TODO - [x] if there's already an sst file with the same name as the number as the wal just delete the wal
+// TODO - [ ] open an sstReader for every sst file (including ones created by wal replay), ordered highest number first
+// TODO - [ ] create the active wal (nextFileNum), its walWriter, and an empty memtable and store them on l
+// TODO - [ ] add a start compaction process step before returning (Close must stop it and wait for it)
+// TODO - [ ] break up function so that file close handling on error is somewhat sane
 func Open(dir string, opts *Options) (_ engine.Engine, err error) {
 	l := &lsm{}
 	defer func() {
@@ -80,6 +81,7 @@ func Open(dir string, opts *Options) (_ engine.Engine, err error) {
 
 	var nextFileNumber uint64 = 0
 	var walNumbers []uint64
+	sstNumbers := make(map[uint64]bool)
 
 	// get the highest file number and all of the current
 	// wal files to that we can rebuild their mem tables
@@ -87,15 +89,28 @@ func Open(dir string, opts *Options) (_ engine.Engine, err error) {
 		if f.Name() == lockFileName {
 			continue
 		}
+
 		num, ext, err := parseDataFileName(f.Name())
 		if err != nil {
 			return nil, err
 		}
+
 		if ext == sstExt || ext == walExt {
 			nextFileNumber = max(nextFileNumber, num)
+
+			if ext == walExt {
+				walNumbers = append(walNumbers, num)
+			}
+
+			if ext == sstExt {
+				sstNumbers[num] = true
+			}
 		}
-		if ext == walExt {
-			walNumbers = append(walNumbers, num)
+
+		// remove any tmp files that may have been left over from a crash or improper shutdown
+		if ext == tmpExt {
+			// best effort. we don't care that much if there was an error on this cleanup pass
+			_ = os.Remove(filepath.Join(absDataDirPath, dataFileName(num, ext)))
 		}
 	}
 	nextFileNumber += 1
@@ -109,6 +124,16 @@ func Open(dir string, opts *Options) (_ engine.Engine, err error) {
 
 	for _, n := range walNumbers {
 		walFilePath := filepath.Join(absDataDirPath, dataFileName(n, walExt))
+
+		// if there's already an sst file with the same number as the wal, just delete the wal
+		// since the sst file is the result of a successful wal replay, we don't need to do it again.
+		if sstNumbers[n] {
+			if err := os.Remove(walFilePath); err != nil {
+				return nil, err
+			}
+			continue
+		}
+
 		walFile, err := os.Open(walFilePath)
 		if err != nil {
 			return nil, err
