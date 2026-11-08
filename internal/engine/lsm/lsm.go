@@ -3,11 +3,13 @@ package lsm
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/tyspice/spicedb/internal/engine"
@@ -37,11 +39,13 @@ type lsm struct {
 	lockFile    *os.File
 	dataDir     string
 	nextFileNum uint64
+	sstmu       sync.RWMutex
+	sstReaders  []*sstReader
 }
 
 // TODO - [x] add something that cleans up left over tmp files
 // TODO - [x] if there's already an sst file with the same name as the number as the wal just delete the wal
-// TODO - [ ] open an sstReader for every sst file (including ones created by wal replay), ordered highest number first
+// TODO - [x] open an sstReader for every sst file (including ones created by wal replay), ordered highest number first
 // TODO - [ ] create the active wal (nextFileNum), its walWriter, and an empty memtable and store them on l
 // TODO - [ ] add a start compaction process step before returning (Close must stop it and wait for it)
 // TODO - [ ] break up function so that file close handling on error is somewhat sane
@@ -81,7 +85,7 @@ func Open(dir string, opts *Options) (_ engine.Engine, err error) {
 
 	var nextFileNumber uint64 = 0
 	var walNumbers []uint64
-	sstNumbers := make(map[uint64]bool)
+	sstMap := make(map[uint64]bool)
 
 	// get the highest file number and all of the current
 	// wal files to that we can rebuild their mem tables
@@ -103,7 +107,7 @@ func Open(dir string, opts *Options) (_ engine.Engine, err error) {
 			}
 
 			if ext == sstExt {
-				sstNumbers[num] = true
+				sstMap[num] = true
 			}
 		}
 
@@ -127,7 +131,7 @@ func Open(dir string, opts *Options) (_ engine.Engine, err error) {
 
 		// if there's already an sst file with the same number as the wal, just delete the wal
 		// since the sst file is the result of a successful wal replay, we don't need to do it again.
-		if sstNumbers[n] {
+		if sstMap[n] {
 			if err := os.Remove(walFilePath); err != nil {
 				return nil, err
 			}
@@ -175,6 +179,16 @@ func Open(dir string, opts *Options) (_ engine.Engine, err error) {
 		}
 	}
 
+	sstNumbers := slices.Sorted(maps.Keys(sstMap))
+	for _, n := range slices.Backward(sstNumbers) {
+		path := filepath.Join(absDataDirPath, dataFileName(n, sstExt))
+		r, err := openSSTableFile(path)
+		if err != nil {
+			return nil, err
+		}
+		l.sstReaders = append(l.sstReaders, r)
+	}
+
 	l.dataDir = absDataDirPath
 	l.nextFileNum = nextFileNumber
 
@@ -195,6 +209,14 @@ func (l *lsm) Delete(key []byte) error {
 
 func (l *lsm) Close() error {
 	defer l.lockFile.Close()
+
+	l.sstmu.Lock()
+	defer l.sstmu.Unlock()
+	for _, r := range l.sstReaders {
+		r.Close()
+	}
+	l.sstReaders = nil
+
 	return nil
 }
 
