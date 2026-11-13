@@ -2,6 +2,7 @@
 package lsm
 
 import (
+	"errors"
 	"fmt"
 	"maps"
 	"os"
@@ -28,6 +29,91 @@ type entryIterator interface {
 	Value() []byte
 	Tombstone() bool
 	Err() error
+}
+
+type lsmWriter struct {
+	mu     sync.RWMutex
+	n      uint64
+	dir    string
+	frozen bool
+	mem    *memtable
+	wal    *walWriter
+}
+
+func newLSMWriter(dir string, f walFile, n uint64) *lsmWriter {
+	return &lsmWriter{n: n, dir: dir, mem: newMemtable(), wal: newWalWriter(f)}
+}
+
+func (lsmW *lsmWriter) Get(key []byte) ([]byte, lookupResult) {
+	lsmW.mu.RLock()
+	defer lsmW.mu.RUnlock()
+	return lsmW.mem.Get(key)
+}
+
+func (lsmW *lsmWriter) Put(key, value []byte) error {
+	return lsmW.addEntry(key, value, kindPut)
+}
+
+func (lsmW *lsmWriter) Delete(key []byte) error {
+	return lsmW.addEntry(key, nil, kindDelete)
+}
+
+func (lsmW *lsmWriter) Freeze() {
+	lsmW.mu.Lock()
+	defer lsmW.mu.Unlock()
+	lsmW.frozen = true
+}
+
+func (lsmW *lsmWriter) Close() error {
+	lsmW.mu.Lock()
+	defer lsmW.mu.Unlock()
+	lsmW.wal.Close()
+	return nil
+}
+
+func (lsmW *lsmWriter) Flush() error {
+	lsmW.mu.Lock()
+	defer lsmW.mu.Unlock()
+
+	if !lsmW.frozen {
+		lsmW.frozen = true
+	}
+
+	if err := flushMemtableToSSTable(lsmW.dir, lsmW.mem, lsmW.n); err != nil {
+		return err
+	}
+
+	if err := lsmW.wal.Close(); err != nil {
+		return err
+	}
+
+	walFilePath := filepath.Join(lsmW.dir, dataFileName(lsmW.n, walExt))
+	if err := os.Remove(walFilePath); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (lsmW *lsmWriter) addEntry(key, value []byte, kind entryKind) error {
+	lsmW.mu.Lock()
+	defer lsmW.mu.Unlock()
+
+	if lsmW.frozen {
+		return errors.New("lsm: writer is frozen")
+	}
+
+	if err := lsmW.wal.AddEntrySync(key, value, kind); err != nil {
+		return err
+	}
+
+	if kind == kindDelete {
+		lsmW.mem.Delete(key)
+	} else {
+		lsmW.mem.Put(key, value)
+	}
+
+	return nil
 }
 
 // Compile-time check that *lsm implements engine.Engine.
@@ -120,12 +206,6 @@ func Open(dir string, opts *Options) (_ engine.Engine, err error) {
 	nextFileNumber += 1
 	slices.Sort(walNumbers)
 
-	dataDir, err := os.Open(absDataDirPath)
-	if err != nil {
-		return nil, err
-	}
-	defer dataDir.Close()
-
 	for _, n := range walNumbers {
 		walFilePath := filepath.Join(absDataDirPath, dataFileName(n, walExt))
 
@@ -144,33 +224,15 @@ func Open(dir string, opts *Options) (_ engine.Engine, err error) {
 		}
 
 		mt, _, err := recoverWal(walFile)
-		walFile.Close()
 		if err != nil {
 			return nil, err
 		}
 
-		tmpSSTPath := filepath.Join(absDataDirPath, dataFileName(n, tmpExt))
-		sstFile, err := os.Create(tmpSSTPath)
-		if err != nil {
+		if err = flushMemtableToSSTable(absDataDirPath, mt, n); err != nil {
 			return nil, err
 		}
 
-		if err := writeSSTable(sstFile, mt.NewIterator()); err != nil {
-			sstFile.Close()
-			return nil, err
-		}
-		if err := sstFile.Sync(); err != nil {
-			sstFile.Close()
-			return nil, err
-		}
-		if err := sstFile.Close(); err != nil {
-			return nil, err
-		}
-
-		if err := os.Rename(tmpSSTPath, filepath.Join(absDataDirPath, dataFileName(n, sstExt))); err != nil {
-			return nil, err
-		}
-		if err := dataDir.Sync(); err != nil {
+		if err = walFile.Close(); err != nil {
 			return nil, err
 		}
 
@@ -216,6 +278,41 @@ func (l *lsm) Close() error {
 		r.Close()
 	}
 	l.sstReaders = nil
+
+	return nil
+}
+
+func flushMemtableToSSTable(dir string, mt *memtable, n uint64) error {
+	tmpSSTPath := filepath.Join(dir, dataFileName(n, tmpExt))
+	sstFile, err := os.Create(tmpSSTPath)
+	if err != nil {
+		return err
+	}
+
+	dataDir, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer dataDir.Close()
+
+	if err := writeSSTable(sstFile, mt.NewIterator()); err != nil {
+		sstFile.Close()
+		return err
+	}
+	if err := sstFile.Sync(); err != nil {
+		sstFile.Close()
+		return err
+	}
+	if err := sstFile.Close(); err != nil {
+		return err
+	}
+
+	if err := os.Rename(tmpSSTPath, filepath.Join(dir, dataFileName(n, sstExt))); err != nil {
+		return err
+	}
+	if err := dataDir.Sync(); err != nil {
+		return err
+	}
 
 	return nil
 }

@@ -21,6 +21,14 @@ const (
 	numEntryKinds // must be last
 )
 
+type lookupResult int
+
+const (
+	notFound lookupResult = iota
+	found
+	foundTombstone
+)
+
 func appendDataEntry(b, key, value []byte, kind entryKind) []byte {
 	b = append(b, byte(kind))
 	b = binary.AppendUvarint(b, uint64(len(key)))
