@@ -32,10 +32,7 @@ func newMemtable() *memtable {
 	return &memtable{root: leaf, leaf: leaf}
 }
 
-// Get queries by key. found reports whether the memtable has an entry for key;
-// deleted reports whether that entry is a tombstone. When found is false,
-// the caller should check older memtables and SSTables.
-func (m *memtable) Get(key []byte) (value []byte, deleted bool, found bool) {
+func (m *memtable) Get(key []byte) ([]byte, lookupResult) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -50,8 +47,16 @@ func (m *memtable) Get(key []byte) (value []byte, deleted bool, found bool) {
 		compared = bytes.Compare(curr.key, key)
 	}
 
+	var r lookupResult = notFound
+	if curr != m.leaf {
+		r = found
+		if curr.tombstone {
+			r = foundTombstone
+		}
+	}
+
 	// TODO Move the clone up to the public lms.Get() boundary once it's in place
-	return bytes.Clone(curr.value), curr.tombstone, curr != m.leaf
+	return bytes.Clone(curr.value), r
 }
 
 func (m *memtable) Put(key, value []byte) {
