@@ -122,17 +122,19 @@ var _ engine.Engine = (*lsm)(nil)
 type Options struct{}
 
 type lsm struct {
-	lockFile    *os.File
-	dataDir     string
-	nextFileNum uint64
-	sstmu       sync.RWMutex
-	sstReaders  []*sstReader
+	mu            sync.Mutex
+	lockFile      *os.File
+	dataDir       string
+	nextFileNum   uint64
+	sstReaders    []*sstReader
+	frozenWriters []*lsmWriter
+	activeWriter  *lsmWriter
 }
 
 // TODO - [x] add something that cleans up left over tmp files
 // TODO - [x] if there's already an sst file with the same name as the number as the wal just delete the wal
 // TODO - [x] open an sstReader for every sst file (including ones created by wal replay), ordered highest number first
-// TODO - [ ] create the active wal (nextFileNum), its walWriter, and an empty memtable and store them on l
+// TODO - [x] create the active wal (nextFileNum), its walWriter, and an empty memtable and store them on l
 // TODO - [ ] add a start compaction process step before returning (Close must stop it and wait for it)
 // TODO - [ ] break up function so that file close handling on error is somewhat sane
 func Open(dir string, opts *Options) (_ engine.Engine, err error) {
@@ -251,6 +253,14 @@ func Open(dir string, opts *Options) (_ engine.Engine, err error) {
 		l.sstReaders = append(l.sstReaders, r)
 	}
 
+	walFile, err := createWalFile(absDataDirPath, nextFileNumber)
+	if err != nil {
+		return nil, err
+	}
+
+	l.activeWriter = newLSMWriter(absDataDirPath, walFile, nextFileNumber)
+	nextFileNumber += 1
+
 	l.dataDir = absDataDirPath
 	l.nextFileNum = nextFileNumber
 
@@ -270,10 +280,10 @@ func (l *lsm) Delete(key []byte) error {
 }
 
 func (l *lsm) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	defer l.lockFile.Close()
 
-	l.sstmu.Lock()
-	defer l.sstmu.Unlock()
 	for _, r := range l.sstReaders {
 		r.Close()
 	}
@@ -315,6 +325,21 @@ func flushMemtableToSSTable(dir string, mt *memtable, n uint64) error {
 	}
 
 	return nil
+}
+
+func createWalFile(dir string, n uint64) (*os.File, error) {
+	path := filepath.Join(dir, dataFileName(n, walExt))
+	_, err := os.Stat(path)
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, errors.New("lsm: wal file already exists")
+	}
+
+	f, err := os.Create(path)
+	if err != nil {
+		return nil, err
+	}
+
+	return f, nil
 }
 
 func parseDataFileName(fileName string) (uint64, string, error) {
