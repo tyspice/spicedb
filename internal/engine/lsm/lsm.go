@@ -2,6 +2,7 @@
 package lsm
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"maps"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/tyspice/spicedb/internal/engine"
 )
@@ -119,25 +121,24 @@ func (lsmW *lsmWriter) addEntry(key, value []byte, kind entryKind) error {
 // Compile-time check that *lsm implements engine.Engine.
 var _ engine.Engine = (*lsm)(nil)
 
-type Options struct{}
-
-type lsm struct {
-	mu            sync.Mutex
-	lockFile      *os.File
-	dataDir       string
-	nextFileNum   uint64
-	sstReaders    []*sstReader
-	frozenWriters []*lsmWriter
-	activeWriter  *lsmWriter
+type Options struct {
+	CompactionInterval time.Duration
 }
 
-// TODO - [x] add something that cleans up left over tmp files
-// TODO - [x] if there's already an sst file with the same name as the number as the wal just delete the wal
-// TODO - [x] open an sstReader for every sst file (including ones created by wal replay), ordered highest number first
-// TODO - [x] create the active wal (nextFileNum), its walWriter, and an empty memtable and store them on l
-// TODO - [ ] add a start compaction process step before returning (Close must stop it and wait for it)
-// TODO - [ ] break up function so that file close handling on error is somewhat sane
-func Open(dir string, opts *Options) (_ engine.Engine, err error) {
+type lsm struct {
+	mu               sync.Mutex
+	lockFile         *os.File
+	dataDir          string
+	nextFileNum      uint64
+	sstReaders       []*sstReader
+	frozenWriters    []*lsmWriter
+	activeWriter     *lsmWriter
+	cancelCompaction context.CancelFunc
+	compactionWg     sync.WaitGroup
+}
+
+// TODO: break up function so that file close handling on error is somewhat sane
+func Open(dir string, opts Options) (_ engine.Engine, err error) {
 	l := &lsm{}
 	defer func() {
 		if err != nil {
@@ -145,8 +146,12 @@ func Open(dir string, opts *Options) (_ engine.Engine, err error) {
 		}
 	}()
 
-	// take control of lock file and set up directory
+	// set default options if not provided
+	if opts.CompactionInterval <= 0 {
+		opts.CompactionInterval = 5 * time.Minute
+	}
 
+	// take control of lock file and set up directory
 	absDataDirPath, err := filepath.Abs(dir)
 	if err != nil {
 		return nil, err
@@ -260,9 +265,25 @@ func Open(dir string, opts *Options) (_ engine.Engine, err error) {
 
 	l.activeWriter = newLSMWriter(absDataDirPath, walFile, nextFileNumber)
 	nextFileNumber += 1
-
 	l.dataDir = absDataDirPath
 	l.nextFileNum = nextFileNumber
+
+	ctx, cancel := context.WithCancel(context.Background())
+	l.cancelCompaction = cancel
+	l.compactionWg.Add(1)
+	go func() {
+		ticker := time.NewTicker(opts.CompactionInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				l.compactionWg.Done()
+				return
+			case <-ticker.C:
+				// TODO: implement compaction logic here
+			}
+		}
+	}()
 
 	return l, nil
 }
@@ -280,9 +301,20 @@ func (l *lsm) Delete(key []byte) error {
 }
 
 func (l *lsm) Close() error {
+	defer l.lockFile.Close()
+
+	l.mu.Lock()
+	cancel := l.cancelCompaction
+	l.cancelCompaction = nil
+	l.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+		l.compactionWg.Wait()
+	}
+
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	defer l.lockFile.Close()
 
 	for _, r := range l.sstReaders {
 		r.Close()
