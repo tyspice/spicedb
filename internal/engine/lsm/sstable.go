@@ -40,7 +40,7 @@ type bloomFilter struct {
 
 // p = false positive rate
 func newBloomFilter(hashes []uint64, p float64) *bloomFilter {
-	// TODO
+	// TODO:
 	return &bloomFilter{}
 }
 
@@ -51,7 +51,7 @@ func (f *bloomFilter) MayContain(key []byte) bool {
 	if f.bits == nil {
 		return true
 	}
-	// TODO
+	// TODO:
 	return true
 }
 
@@ -246,7 +246,7 @@ func writeSSTable(w io.Writer, iter entryIterator) error {
 	}
 	filterOffset := uint64(offset)
 
-	// TODO decide where p is coming from (probably config or maybe caller)
+	// TODO: decide where p is coming from (probably config or maybe caller)
 	filter := newBloomFilter(hashes, 0)
 	bw.Write(appendBloomFilter(buf[:0], filter))
 	bw.Write(appendFooter(buf[:0], indexOffset, filterOffset))
@@ -321,17 +321,17 @@ func (it *sstIterator) Err() error {
 }
 
 func appendBloomFilter(b []byte, f *bloomFilter) []byte {
-	// TODO
+	// TODO:
 	return b
 }
 
 func decodeBloomFilter(b []byte) (*bloomFilter, error) {
-	// TODO
+	// TODO:
 	return &bloomFilter{}, nil
 }
 
 func hashKey(key []byte) uint64 {
-	// TODO
+	// TODO:
 	return 0
 }
 

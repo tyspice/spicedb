@@ -55,7 +55,7 @@ func (m *memtable) Get(key []byte) ([]byte, lookupResult) {
 		}
 	}
 
-	// TODO Move the clone up to the public lms.Get() boundary once it's in place
+	// TODO: Move the clone up to the public lms.Get() boundary once it's in place
 	return bytes.Clone(curr.value), r
 }
 
