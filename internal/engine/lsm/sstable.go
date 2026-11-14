@@ -26,14 +26,6 @@ const (
 	blockSize                  = 4096 // 4KB
 )
 
-type lookupResult int
-
-const (
-	notFound lookupResult = iota
-	found
-	foundTombstone
-)
-
 type indexEntry struct {
 	key    []byte
 	offset int64
