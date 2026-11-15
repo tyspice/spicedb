@@ -34,12 +34,13 @@ type entryIterator interface {
 }
 
 type lsmWriter struct {
-	mu     sync.RWMutex
-	n      uint64
-	dir    string
-	frozen bool
-	mem    *memtable
-	wal    *walWriter
+	mu      sync.RWMutex
+	n       uint64
+	dir     string
+	frozen  bool
+	flushed bool
+	mem     *memtable
+	wal     *walWriter
 }
 
 func newLSMWriter(dir string, f walFile, n uint64) *lsmWriter {
@@ -52,11 +53,11 @@ func (lsmW *lsmWriter) Get(key []byte) ([]byte, lookupResult) {
 	return lsmW.mem.Get(key)
 }
 
-func (lsmW *lsmWriter) Put(key, value []byte) error {
+func (lsmW *lsmWriter) Put(key, value []byte) (mSize int, _ error) {
 	return lsmW.addEntry(key, value, kindPut)
 }
 
-func (lsmW *lsmWriter) Delete(key []byte) error {
+func (lsmW *lsmWriter) Delete(key []byte) (mSize int, _ error) {
 	return lsmW.addEntry(key, nil, kindDelete)
 }
 
@@ -73,7 +74,25 @@ func (lsmW *lsmWriter) Close() error {
 	return nil
 }
 
-func (lsmW *lsmWriter) Flush() error {
+func (lsmW *lsmWriter) Flush() (sstFilePath string, err error) {
+	// closeAndDeleteWal is idempotent: a WAL that is already closed or
+	// already deleted counts as success, and the remove is attempted
+	// even if the close failed, so a retry can finish a partial cleanup.
+	closeAndDeleteWal := func() error {
+		closeErr := lsmW.wal.Close()
+		if errors.Is(closeErr, os.ErrClosed) {
+			closeErr = nil
+		}
+
+		walFilePath := filepath.Join(lsmW.dir, dataFileName(lsmW.n, walExt))
+		removeErr := os.Remove(walFilePath)
+		if errors.Is(removeErr, os.ErrNotExist) {
+			removeErr = nil
+		}
+
+		return errors.Join(closeErr, removeErr)
+	}
+
 	lsmW.mu.Lock()
 	defer lsmW.mu.Unlock()
 
@@ -81,32 +100,32 @@ func (lsmW *lsmWriter) Flush() error {
 		lsmW.frozen = true
 	}
 
-	if err := flushMemtableToSSTable(lsmW.dir, lsmW.mem, lsmW.n); err != nil {
-		return err
+	// once the sstable is durable the memtable never needs to be
+	// written again; retries only need to finish the WAL cleanup
+	if !lsmW.flushed {
+		if _, err = flushMemtableToSSTable(lsmW.dir, lsmW.mem, lsmW.n); err != nil {
+			return "", err
+		}
+		lsmW.flushed = true
 	}
 
-	if err := lsmW.wal.Close(); err != nil {
-		return err
+	if err = closeAndDeleteWal(); err != nil {
+		return "", err
 	}
 
-	walFilePath := filepath.Join(lsmW.dir, dataFileName(lsmW.n, walExt))
-	if err := os.Remove(walFilePath); err != nil {
-		return err
-	}
-
-	return nil
+	return filepath.Join(lsmW.dir, dataFileName(lsmW.n, sstExt)), nil
 }
 
-func (lsmW *lsmWriter) addEntry(key, value []byte, kind entryKind) error {
+func (lsmW *lsmWriter) addEntry(key, value []byte, kind entryKind) (mSize int, _ error) {
 	lsmW.mu.Lock()
 	defer lsmW.mu.Unlock()
 
 	if lsmW.frozen {
-		return errors.New("lsm: writer is frozen")
+		return 0, errors.New("lsm: writer is frozen")
 	}
 
 	if err := lsmW.wal.AddEntrySync(key, value, kind); err != nil {
-		return err
+		return 0, err
 	}
 
 	if kind == kindDelete {
@@ -115,7 +134,7 @@ func (lsmW *lsmWriter) addEntry(key, value []byte, kind entryKind) error {
 		lsmW.mem.Put(key, value)
 	}
 
-	return nil
+	return lsmW.mem.Size(), nil
 }
 
 // Compile-time check that *lsm implements engine.Engine.
@@ -123,6 +142,7 @@ var _ engine.Engine = (*lsm)(nil)
 
 type Options struct {
 	CompactionInterval time.Duration
+	maxMemtableSize    int
 }
 
 type lsm struct {
@@ -134,7 +154,8 @@ type lsm struct {
 	frozenWriters    []*lsmWriter
 	activeWriter     *lsmWriter
 	cancelCompaction context.CancelFunc
-	compactionWg     sync.WaitGroup
+	wg               sync.WaitGroup
+	opts             Options
 }
 
 // TODO: break up function so that file close handling on error is somewhat sane
@@ -149,6 +170,10 @@ func Open(dir string, opts Options) (_ engine.Engine, err error) {
 	// set default options if not provided
 	if opts.CompactionInterval <= 0 {
 		opts.CompactionInterval = 5 * time.Minute
+	}
+
+	if opts.maxMemtableSize <= 0 {
+		opts.maxMemtableSize = 4 << 20 // 4 MiB
 	}
 
 	// take control of lock file and set up directory
@@ -235,7 +260,7 @@ func Open(dir string, opts Options) (_ engine.Engine, err error) {
 			return nil, err
 		}
 
-		if err = flushMemtableToSSTable(absDataDirPath, mt, n); err != nil {
+		if _, err = flushMemtableToSSTable(absDataDirPath, mt, n); err != nil {
 			return nil, err
 		}
 
@@ -265,19 +290,21 @@ func Open(dir string, opts Options) (_ engine.Engine, err error) {
 
 	l.activeWriter = newLSMWriter(absDataDirPath, walFile, nextFileNumber)
 	nextFileNumber += 1
+
 	l.dataDir = absDataDirPath
 	l.nextFileNum = nextFileNumber
+	l.opts = opts
 
 	ctx, cancel := context.WithCancel(context.Background())
 	l.cancelCompaction = cancel
-	l.compactionWg.Add(1)
+	l.wg.Add(1)
 	go func() {
 		ticker := time.NewTicker(opts.CompactionInterval)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
-				l.compactionWg.Done()
+				l.wg.Done()
 				return
 			case <-ticker.C:
 				// TODO: implement compaction logic here
@@ -323,23 +350,92 @@ func (l *lsm) Get(key []byte) ([]byte, error) {
 }
 
 func (l *lsm) Put(key, value []byte) error {
-	// activeWriter has its own mutex to lock writes
-	// we use an RLock here because the top level
-	// lsm mutex should lock when actual field
-	// objects on the lsm change
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-	return l.activeWriter.Put(key, value)
+	return l.addEntry(key, value, kindPut)
 }
 
 func (l *lsm) Delete(key []byte) error {
+	return l.addEntry(key, nil, kindDelete)
+}
+
+func (l *lsm) addEntry(key, value []byte, kind entryKind) (err error) {
 	// activeWriter has its own mutex to lock writes
 	// we use an RLock here because the top level
 	// lsm mutex should lock when actual field
 	// objects on the lsm change
 	l.mu.RLock()
-	defer l.mu.RUnlock()
-	return l.activeWriter.Delete(key)
+	w := l.activeWriter
+	var mSize int
+	switch kind {
+	case kindPut:
+		mSize, err = w.Put(key, value)
+	case kindDelete:
+		mSize, err = w.Delete(key)
+	}
+	l.mu.RUnlock()
+
+	if err != nil {
+		return err
+	}
+
+	// if the memtable has exceeded the maxMemtableSize
+	// then we rotate it out and spin up a new memtable
+	if mSize >= l.opts.maxMemtableSize {
+		l.mu.Lock()
+		// if the instances are different it means that another
+		// goroutine already rotated the table out so noothing to do
+		if w == l.activeWriter {
+			n := l.nextFileNum
+			f, err := createWalFile(l.dataDir, n)
+			if err != nil {
+				l.mu.Unlock()
+				return fmt.Errorf("lsm: rotate memtable: %w", err)
+			}
+			w.Freeze()
+			l.frozenWriters = append(l.frozenWriters, w)
+			l.activeWriter = newLSMWriter(l.dataDir, f, n)
+			l.nextFileNum += 1
+		}
+		l.mu.Unlock()
+		// after rotation we flush the frozen memtables
+		// in the background so that doesn't hold up the
+		// response
+		// FIXME: race: this can technically still add to wg during a wg.Wait() on close.
+		l.wg.Go(func() {
+			// TODO: capture the error return and log it once we have a logger
+			l.flushFrozenWriters()
+		})
+	}
+	return nil
+}
+
+func (l *lsm) flushFrozenWriters() error {
+	formattedErr := func(err error) error {
+		return fmt.Errorf("lsm: flush frozen writers: %w", err)
+	}
+
+	// TODO: This locks for the whole flush process. Break up the locks
+	// so it's onoly holding up the engine for the actual swaps that it
+	// needs to do.
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	for len(l.frozenWriters) > 0 {
+		w := l.frozenWriters[0]
+		sstFilePath, err := w.Flush()
+		if err != nil {
+			return formattedErr(err)
+		}
+
+		sstReader, err := openSSTableFile(sstFilePath)
+		if err != nil {
+			return formattedErr(err)
+		}
+
+		l.sstReaders = append(l.sstReaders, sstReader)
+		l.frozenWriters[0] = nil
+		l.frozenWriters = l.frozenWriters[1:]
+	}
+	return nil
 }
 
 func (l *lsm) Close() error {
@@ -352,8 +448,8 @@ func (l *lsm) Close() error {
 
 	if cancel != nil {
 		cancel()
-		l.compactionWg.Wait()
 	}
+	l.wg.Wait()
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -363,42 +459,47 @@ func (l *lsm) Close() error {
 	}
 	l.sstReaders = nil
 
+	// TODO: close the activeWriter and any frozenWriters that were never flushed
+	// so their WAL files aren't left open.
+
 	return nil
 }
 
-func flushMemtableToSSTable(dir string, mt *memtable, n uint64) error {
+func flushMemtableToSSTable(dir string, mt *memtable, n uint64) (sstFilePath string, err error) {
 	tmpSSTPath := filepath.Join(dir, dataFileName(n, tmpExt))
 	sstFile, err := os.Create(tmpSSTPath)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	dataDir, err := os.Open(dir)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer dataDir.Close()
 
 	if err := writeSSTable(sstFile, mt.NewIterator()); err != nil {
 		sstFile.Close()
-		return err
+		return "", err
 	}
 	if err := sstFile.Sync(); err != nil {
 		sstFile.Close()
-		return err
+		return "", err
 	}
 	if err := sstFile.Close(); err != nil {
-		return err
+		return "", err
 	}
 
-	if err := os.Rename(tmpSSTPath, filepath.Join(dir, dataFileName(n, sstExt))); err != nil {
-		return err
+	sstFilePath = filepath.Join(dir, dataFileName(n, sstExt))
+	if err := os.Rename(tmpSSTPath, sstFilePath); err != nil {
+		return "", err
 	}
+
 	if err := dataDir.Sync(); err != nil {
-		return err
+		return "", err
 	}
 
-	return nil
+	return sstFilePath, nil
 }
 
 func createWalFile(dir string, n uint64) (*os.File, error) {
