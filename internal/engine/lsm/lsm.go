@@ -147,6 +147,7 @@ type Options struct {
 
 type lsm struct {
 	mu               sync.RWMutex
+	closed           bool
 	lockFile         *os.File
 	dataDir          string
 	nextFileNum      uint64
@@ -316,6 +317,7 @@ func Open(dir string, opts Options) (_ engine.Engine, err error) {
 }
 
 func (l *lsm) Get(key []byte) ([]byte, error) {
+	l.checkClosed()
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
@@ -350,10 +352,12 @@ func (l *lsm) Get(key []byte) ([]byte, error) {
 }
 
 func (l *lsm) Put(key, value []byte) error {
+	l.checkClosed()
 	return l.addEntry(key, value, kindPut)
 }
 
 func (l *lsm) Delete(key []byte) error {
+	l.checkClosed()
 	return l.addEntry(key, nil, kindDelete)
 }
 
@@ -438,8 +442,18 @@ func (l *lsm) flushFrozenWriters() error {
 	return nil
 }
 
+func (l *lsm) checkClosed() {
+	if l.closed {
+		panic("lsm: closed")
+	}
+}
+
 func (l *lsm) Close() error {
-	defer l.lockFile.Close()
+	if l.closed {
+		return nil
+	}
+
+	var closeErrors []error
 
 	l.mu.Lock()
 	cancel := l.cancelCompaction
@@ -455,14 +469,19 @@ func (l *lsm) Close() error {
 	defer l.mu.Unlock()
 
 	for _, r := range l.sstReaders {
-		r.Close()
+		closeErrors = append(closeErrors, r.Close())
 	}
-	l.sstReaders = nil
 
-	// TODO: close the activeWriter and any frozenWriters that were never flushed
-	// so their WAL files aren't left open.
+	closeErrors = append(closeErrors, l.activeWriter.Close())
 
-	return nil
+	for _, r := range l.frozenWriters {
+		closeErrors = append(closeErrors, r.Close())
+	}
+
+	closeErrors = append(closeErrors, l.lockFile.Close())
+
+	l.closed = true
+	return errors.Join(closeErrors...)
 }
 
 func flushMemtableToSSTable(dir string, mt *memtable, n uint64) (sstFilePath string, err error) {
