@@ -126,7 +126,7 @@ type Options struct {
 }
 
 type lsm struct {
-	mu               sync.Mutex
+	mu               sync.RWMutex
 	lockFile         *os.File
 	dataDir          string
 	nextFileNum      uint64
@@ -289,15 +289,57 @@ func Open(dir string, opts Options) (_ engine.Engine, err error) {
 }
 
 func (l *lsm) Get(key []byte) ([]byte, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	result := func(v []byte, res lookupResult, err error) ([]byte, error) {
+		if err != nil || res == foundTombstone {
+			return nil, err
+		}
+		return v, err
+	}
+
+	// first check the active writer
+	if v, res := l.activeWriter.Get(key); res != notFound {
+		return result(v, res, nil)
+	}
+
+	// then check the frozen writers back to front
+	for _, w := range slices.Backward(l.frozenWriters) {
+		if v, res := w.Get(key); res != notFound {
+			return result(v, res, nil)
+		}
+	}
+
+	// then check the sstables back to front
+	for _, r := range slices.Backward(l.sstReaders) {
+		if r.MayContain(key) {
+			if v, res, err := r.Get(key); res != notFound || err != nil {
+				return result(v, res, err)
+			}
+		}
+	}
 	return nil, nil
 }
 
 func (l *lsm) Put(key, value []byte) error {
-	return nil
+	// activeWriter has its own mutex to lock writes
+	// we use an RLock here because the top level
+	// lsm mutex should lock when actual field
+	// objects on the lsm change
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.activeWriter.Put(key, value)
 }
 
 func (l *lsm) Delete(key []byte) error {
-	return nil
+	// activeWriter has its own mutex to lock writes
+	// we use an RLock here because the top level
+	// lsm mutex should lock when actual field
+	// objects on the lsm change
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.activeWriter.Delete(key)
 }
 
 func (l *lsm) Close() error {
