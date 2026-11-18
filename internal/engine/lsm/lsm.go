@@ -160,7 +160,7 @@ type lsm struct {
 }
 
 // TODO: break up function so that file close handling on error is somewhat sane
-func Open(dir string, opts Options) (_ engine.Engine, err error) {
+func Open(dir string, opts Options) (_ *lsm, err error) {
 	l := &lsm{}
 	defer func() {
 		if err != nil {
